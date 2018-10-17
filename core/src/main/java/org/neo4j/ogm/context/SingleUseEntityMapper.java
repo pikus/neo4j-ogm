@@ -18,6 +18,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 import org.neo4j.ogm.exception.core.MappingException;
 import org.neo4j.ogm.metadata.ClassInfo;
@@ -44,6 +48,12 @@ public class SingleUseEntityMapper {
 
     private final EntityFactory entityFactory;
     private final MetaData metadata;
+    /**
+     * This is a supplier for a predicate that can determine whether a named property is a constructor argument or not.
+     * As this mapper here was meant to be a "single use" instance, the predicate itself could be carried around as well,
+     * but in the end: Better safe, than sorry.
+     */
+    private final Function<Class<?>, Optional<Predicate<String>>> constructorArgumentPredicateSupplier;
 
     /**
      * Compatibility constructor for SDN 5.0
@@ -54,6 +64,7 @@ public class SingleUseEntityMapper {
     public SingleUseEntityMapper(MetaData mappingMetaData, EntityFactory entityFactory) {
         this.metadata = mappingMetaData;
         this.entityFactory = new EntityFactory(mappingMetaData);
+        this.constructorArgumentPredicateSupplier = clazz -> Optional.empty();
     }
 
     /**
@@ -65,6 +76,7 @@ public class SingleUseEntityMapper {
     public SingleUseEntityMapper(MetaData mappingMetaData, EntityInstantiator entityInstantiator) {
         this.metadata = mappingMetaData;
         this.entityFactory = new EntityFactory(mappingMetaData, entityInstantiator);
+        this.constructorArgumentPredicateSupplier = entityInstantiator.getConstructorArgumentPredicateSupplier();
     }
 
     /**
@@ -94,10 +106,14 @@ public class SingleUseEntityMapper {
     }
 
     private void setPropertiesOnEntity(Object entity, Map<String, Object> propertyMap) {
-        ClassInfo classInfo = resolveClassInfoFor(entity.getClass());
-        for (Entry<String, Object> propertyMapEntry : propertyMap.entrySet()) {
-            writeProperty(classInfo, entity, propertyMapEntry);
-        }
+        Class<?> entityClass = entity.getClass();
+        ClassInfo entityClassInfo = resolveClassInfoFor(entityClass);
+        Predicate<String> isConstructorArgument = this.constructorArgumentPredicateSupplier
+            .apply(entityClass).orElseGet(() -> name -> false);
+
+        propertyMap.entrySet().stream()
+            .filter(entry -> !isConstructorArgument.test(entry.getKey()))
+            .forEach(entry -> writeProperty(entityClassInfo, entity, entry));
     }
 
     private ClassInfo resolveClassInfoFor(Class<?> type) {
@@ -105,44 +121,37 @@ public class SingleUseEntityMapper {
         if (classInfo != null) {
             return classInfo;
         }
-        throw new MappingException("Error mapping to ad-hoc " + type +
-            ".  At present, only @Result types that are discovered by the domain entity package scanning can be mapped.");
+        throw new MappingException("Cannot map query result to a class not known by Neo4j-OGM.");
     }
 
-    // TODO: the following is all pretty much identical to GraphEntityMapper so should probably be refactored
     private void writeProperty(ClassInfo classInfo, Object instance, Map.Entry<String, Object> property) {
 
-        FieldInfo writer = classInfo.getFieldInfo(property.getKey());
+        String propertyName = property.getKey();
+        FieldInfo targetFieldInfo = classInfo.getFieldInfo(propertyName);
 
-        if (writer == null) {
-            FieldInfo fieldInfo = classInfo.relationshipFieldByName(property.getKey());
-            if (fieldInfo != null) {
-                writer = fieldInfo;
-            }
+        if (targetFieldInfo == null) {
+            targetFieldInfo = classInfo.relationshipFieldByName(propertyName);
         }
 
-        if (writer == null && property.getKey().equals(
-            "id")) { //When mapping query results to objects that are not domain entities, there's no concept of a GraphID
-            FieldInfo idField = classInfo.identityField();
-            if (idField != null) {
-                writer = idField;
-            }
+        // When mapping query results to objects that are not domain entities, there's no concept of a GraphID
+        if (targetFieldInfo == null && "id".equals(propertyName)) {
+            targetFieldInfo = classInfo.identityField();
         }
 
-        if (writer != null) {
+        if (targetFieldInfo == null) {
+            logger.debug("Unable to find property: {} on class: {} for writing", propertyName, classInfo.name());
+        } else {
             Object value = property.getValue();
             if (value != null && value.getClass().isArray()) {
                 value = Arrays.asList((Object[]) value);
             }
-            if (writer.type().isArray() || Iterable.class.isAssignableFrom(writer.type())) {
-                Class elementType = underlyingElementType(classInfo, property.getKey());
-                value = writer.type().isArray()
-                    ? EntityAccessManager.merge(writer.type(), value, new Object[] {}, elementType)
-                    : EntityAccessManager.merge(writer.type(), value, Collections.EMPTY_LIST, elementType);
+            if (targetFieldInfo.type().isArray() || Iterable.class.isAssignableFrom(targetFieldInfo.type())) {
+                Class elementType = underlyingElementType(classInfo, propertyName);
+                value = targetFieldInfo.type().isArray()
+                    ? EntityAccessManager.merge(targetFieldInfo.type(), value, new Object[] {}, elementType)
+                    : EntityAccessManager.merge(targetFieldInfo.type(), value, Collections.EMPTY_LIST, elementType);
             }
-            writer.write(instance, value);
-        } else {
-            logger.warn("Unable to find property: {} on class: {} for writing", property.getKey(), classInfo.name());
+            targetFieldInfo.write(instance, value);
         }
     }
 
